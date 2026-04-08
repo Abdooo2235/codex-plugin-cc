@@ -1,12 +1,113 @@
 import fs from "node:fs";
 
 import { getSessionRuntimeStatus } from "./codex.mjs";
-import { getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
-import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
+import { isProcessAlive } from "./process.mjs";
+import { getConfig, listJobs, readJobFile, resolveJobFile, upsertJob, writeJobFile } from "./state.mjs";
+import { appendLogLine, SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 export const DEFAULT_MAX_STATUS_JOBS = 8;
 export const DEFAULT_MAX_PROGRESS_LINES = 4;
+
+function isActiveJob(job) {
+  return job.status === "queued" || job.status === "running";
+}
+
+function normalizeTrackedPid(pid) {
+  const numeric = Number(pid);
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : null;
+}
+
+export function markDeadPidJobFailed(workspaceRoot, jobId, pid) {
+  const observedPid = normalizeTrackedPid(pid);
+  if (observedPid == null) {
+    return false;
+  }
+  const jobFile = resolveJobFile(workspaceRoot, jobId);
+
+  let latestJob;
+  try {
+    latestJob = readJobFile(jobFile);
+  } catch {
+    return false;
+  }
+
+  if (!isActiveJob(latestJob)) {
+    return false;
+  }
+
+  if (normalizeTrackedPid(latestJob.pid) !== observedPid) {
+    return false;
+  }
+
+  const completedAt = new Date().toISOString();
+  const errorMessage = `Process PID ${observedPid} exited unexpectedly`;
+  const failedPatch = {
+    status: "failed",
+    phase: "failed",
+    pid: null,
+    errorMessage,
+    completedAt
+  };
+
+  writeJobFile(workspaceRoot, jobId, {
+    ...latestJob,
+    ...failedPatch
+  });
+  appendLogLine(latestJob.logFile ?? null, `Failed: ${errorMessage}`);
+  upsertJob(workspaceRoot, {
+    id: jobId,
+    ...failedPatch
+  });
+  return true;
+}
+
+function reconcileDeadPidJob(workspaceRoot, job) {
+  const trackedPid = normalizeTrackedPid(job.pid);
+  if (!isActiveJob(job) || trackedPid == null) {
+    return job;
+  }
+  if (isProcessAlive(trackedPid)) {
+    return job;
+  }
+
+  const didFail = markDeadPidJobFailed(workspaceRoot, job.id, trackedPid);
+  try {
+    const storedJob = readJobFile(resolveJobFile(workspaceRoot, job.id));
+    const indexedJob = listJobs(workspaceRoot).find((candidate) => candidate.id === job.id) ?? job;
+    if (didFail) {
+      return {
+        ...indexedJob,
+        ...storedJob
+      };
+    }
+    if (!isActiveJob(storedJob)) {
+      upsertJob(workspaceRoot, {
+        id: job.id,
+        status: storedJob.status ?? null,
+        phase: storedJob.phase ?? null,
+        pid: Number.isFinite(storedJob.pid) ? storedJob.pid : null,
+        completedAt: storedJob.completedAt ?? null,
+        errorMessage: storedJob.errorMessage ?? null,
+        threadId: storedJob.threadId ?? null,
+        turnId: storedJob.turnId ?? null,
+        summary: storedJob.summary ?? job.summary ?? null
+      });
+      return {
+        ...indexedJob,
+        ...storedJob
+      };
+    }
+  } catch {
+    return job;
+  }
+
+  return job;
+}
+
+function reconcileDeadPidJobs(workspaceRoot, jobs) {
+  return jobs.map((job) => reconcileDeadPidJob(workspaceRoot, job));
+}
 
 export function sortJobsNewestFirst(jobs) {
   return [...jobs].sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
@@ -213,19 +314,19 @@ function matchJobReference(jobs, reference, predicate = () => true) {
 export function buildStatusSnapshot(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const config = getConfig(workspaceRoot);
-  const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobs(workspaceRoot), options));
+  const jobs = sortJobsNewestFirst(reconcileDeadPidJobs(workspaceRoot, filterJobsForCurrentSession(listJobs(workspaceRoot), options)));
   const maxJobs = options.maxJobs ?? DEFAULT_MAX_STATUS_JOBS;
   const maxProgressLines = options.maxProgressLines ?? DEFAULT_MAX_PROGRESS_LINES;
 
   const running = jobs
-    .filter((job) => job.status === "queued" || job.status === "running")
+    .filter((job) => isActiveJob(job))
     .map((job) => enrichJob(job, { maxProgressLines }));
 
-  const latestFinishedRaw = jobs.find((job) => job.status !== "queued" && job.status !== "running") ?? null;
+  const latestFinishedRaw = jobs.find((job) => !isActiveJob(job)) ?? null;
   const latestFinished = latestFinishedRaw ? enrichJob(latestFinishedRaw, { maxProgressLines }) : null;
 
   const recent = (options.all ? jobs : jobs.slice(0, maxJobs))
-    .filter((job) => job.status !== "queued" && job.status !== "running" && job.id !== latestFinished?.id)
+    .filter((job) => !isActiveJob(job) && job.id !== latestFinished?.id)
     .map((job) => enrichJob(job, { maxProgressLines }));
 
   return {
@@ -241,7 +342,7 @@ export function buildStatusSnapshot(cwd, options = {}) {
 
 export function buildSingleJobSnapshot(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
+  const jobs = sortJobsNewestFirst(reconcileDeadPidJobs(workspaceRoot, listJobs(workspaceRoot)));
   const selected = matchJobReference(jobs, reference);
   if (!selected) {
     throw new Error(`No job found for "${reference}". Run /codex:status to inspect known jobs.`);
@@ -255,18 +356,20 @@ export function buildSingleJobSnapshot(cwd, reference, options = {}) {
 
 export function resolveResultJob(cwd, reference) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(reference ? listJobs(workspaceRoot) : filterJobsForCurrentSession(listJobs(workspaceRoot)));
+  const jobs = sortJobsNewestFirst(
+    reconcileDeadPidJobs(workspaceRoot, reference ? listJobs(workspaceRoot) : filterJobsForCurrentSession(listJobs(workspaceRoot)))
+  );
   const selected = matchJobReference(
     jobs,
     reference,
-    (job) => job.status === "completed" || job.status === "failed" || job.status === "cancelled"
+    (job) => !isActiveJob(job)
   );
 
   if (selected) {
     return { workspaceRoot, job: selected };
   }
 
-  const active = matchJobReference(jobs, reference, (job) => job.status === "queued" || job.status === "running");
+  const active = matchJobReference(jobs, reference, (job) => isActiveJob(job));
   if (active) {
     throw new Error(`Job ${active.id} is still ${active.status}. Check /codex:status and try again once it finishes.`);
   }
@@ -280,8 +383,8 @@ export function resolveResultJob(cwd, reference) {
 
 export function resolveCancelableJob(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
-  const activeJobs = jobs.filter((job) => job.status === "queued" || job.status === "running");
+  const jobs = sortJobsNewestFirst(reconcileDeadPidJobs(workspaceRoot, listJobs(workspaceRoot)));
+  const activeJobs = jobs.filter((job) => isActiveJob(job));
 
   if (reference) {
     const selected = matchJobReference(activeJobs, reference);

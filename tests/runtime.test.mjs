@@ -1216,6 +1216,95 @@ test("status --wait times out cleanly when a job is still active", () => {
   assert.equal(payload.waitTimedOut, true);
 });
 
+test("status preserves indexed metadata after dead-pid reconciliation", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  const deadPid = 9_999_997;
+  const deadLog = path.join(jobsDir, "task-dead.log");
+  const deadJobFile = path.join(jobsDir, "task-dead.json");
+  fs.writeFileSync(deadLog, "[2026-03-18T15:30:00.000Z] Starting Codex Task.\n", "utf8");
+  fs.writeFileSync(
+    deadJobFile,
+    JSON.stringify(
+      {
+        id: "task-dead",
+        status: "running",
+        title: "Codex Task",
+        pid: deadPid,
+        logFile: deadLog
+      },
+      null,
+      2
+    ),
+    "utf8"
+  );
+
+  fs.writeFileSync(
+    path.join(jobsDir, "review-older.json"),
+    JSON.stringify(
+      {
+        id: "review-older",
+        status: "completed",
+        title: "Codex Review",
+        rendered: "No issues.\n"
+      },
+      null,
+      2
+    ),
+    "utf8"
+  );
+
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "review-older",
+            status: "completed",
+            title: "Codex Review",
+            jobClass: "review",
+            summary: "Older completed review",
+            createdAt: "2026-03-18T15:20:00.000Z",
+            updatedAt: "2026-03-18T15:21:00.000Z"
+          },
+          {
+            id: "task-dead",
+            status: "running",
+            title: "Codex Task",
+            jobClass: "task",
+            summary: "Investigate flaky test",
+            pid: deadPid,
+            logFile: deadLog,
+            createdAt: "2026-03-18T15:30:00.000Z",
+            startedAt: "2026-03-18T15:30:01.000Z",
+            updatedAt: "2026-03-18T15:30:02.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [SCRIPT, "status", "--json"], { cwd: workspace });
+  assert.equal(result.status, 0, result.stderr);
+
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.latestFinished?.id, "task-dead");
+  assert.equal(payload.latestFinished?.status, "failed");
+  assert.equal(payload.latestFinished?.jobClass, "task");
+  assert.equal(payload.latestFinished?.summary, "Investigate flaky test");
+  assert.equal(payload.latestFinished?.kindLabel, "rescue");
+  assert.match(String(payload.latestFinished?.errorMessage ?? ""), /Process PID \d+ exited unexpectedly/);
+});
+
 test("result returns the stored output for the latest finished job by default", () => {
   const workspace = makeTempDir();
   const stateDir = resolveStateDir(workspace);
